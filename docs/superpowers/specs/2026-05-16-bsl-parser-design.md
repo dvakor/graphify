@@ -96,7 +96,27 @@ for func_nid, body_node in function_bodies:
 
 For normal body nodes (block, statement_block, etc.), pass body_node directly as before.
 
-Location: in the body-detection logic within `_extract_generic`, after the existing `_find_body()` call.
+Location: two changes in `_extract_generic`:
+
+**Change 1 — body detection** (after `_find_body` call):
+```python
+body = _find_body(node, config)
+if body:
+    function_bodies.append((func_nid, body))
+elif t in config.function_types:  # flat-body: no wrapper, statements are direct children
+    function_bodies.append((func_nid, node))
+return
+```
+
+**Change 2 — walk_calls loop** (iterate children when body is a boundary type):
+```python
+for caller_nid, body_node in function_bodies:
+    if body_node.type in config.function_boundary_types:
+        for child in body_node.children:
+            walk_calls(child, caller_nid)
+    else:
+        walk_calls(body_node, caller_nid)
+```
 
 ### 3. BSL block in `walk_calls` (in `_extract_generic`)
 
@@ -108,8 +128,11 @@ elif config.ts_module == "tree_sitter_bsl":
         name_node = node.child_by_field_name("name")
         if name_node:
             callee_name = _read_text(name_node, source)
-        # Determine is_member_call: method_call inside call_expression
-        if node.parent and node.parent.type == "call_expression":
+        # Determine is_member_call: method_call inside call_expression or access
+        # Direct call:   call_statement → method_call          (parent=call_statement)
+        # Obj.Method():  call_statement → call_expression → method_call  (parent=call_expression)
+        # A.B().C():     call_expression → access → method_call          (parent=access)
+        if node.parent and node.parent.type in ("call_expression", "access"):
             is_member_call = True
     elif node.type == "new_expression":
         # Новый HTTPСервисОтвет(200) → callee = HTTPСервисОтвет
