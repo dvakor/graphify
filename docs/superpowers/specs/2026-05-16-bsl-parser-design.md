@@ -67,7 +67,7 @@ _BSL_CONFIG = LanguageConfig(
     ts_module="tree_sitter_bsl",
     class_types=frozenset(),
     function_types=frozenset({"procedure_definition", "function_definition"}),
-    call_types=frozenset({"method_call"}),
+    call_types=frozenset({"method_call", "new_expression"}),  # new_expression: Новый Запрос()
     call_function_field="name",
     function_boundary_types=frozenset({"procedure_definition", "function_definition"}),
     import_types=frozenset(),
@@ -77,9 +77,24 @@ _BSL_CONFIG = LanguageConfig(
 )
 ```
 
+`new_expression` handles constructor calls like `Новый HTTPСервисОтвет(200)`. In `walk_calls`, the BSL block extracts the type name from the first `identifier` child.
+
 ### 2. Flat-body fix (in `_extract_generic`)
 
-After `_find_body()`, if body is `None` and the node type is in `config.function_types`, use the node itself as body. This is a universal fix, not BSL-specific — applies to any language where function bodies are flat.
+After `_find_body()`, if body is `None` and the node type is in `config.function_types`, use the node itself as body. This is a universal fix, not BSL-specific — applies to any language where function bodies are flat. BSL is currently the only language triggering this path.
+
+**Important:** Since `body` IS the function node itself, passing it directly to `walk_calls` would hit the `function_boundary_types` check and return immediately. Instead, when the body node type is in `function_boundary_types`, iterate its children:
+
+```python
+for func_nid, body_node in function_bodies:
+    if body_node.type in config.function_boundary_types:
+        for child in body_node.children:
+            walk_calls(child, func_nid)
+    else:
+        walk_calls(body_node, func_nid)
+```
+
+For normal body nodes (block, statement_block, etc.), pass body_node directly as before.
 
 Location: in the body-detection logic within `_extract_generic`, after the existing `_find_body()` call.
 
@@ -89,12 +104,19 @@ Inside the per-language dispatch in `walk_calls`, add a block for `tree_sitter_b
 
 ```python
 elif config.ts_module == "tree_sitter_bsl":
-    name_node = node.child_by_field_name("name")
-    if name_node:
-        callee_name = _read_text(name_node, source)
-    # Determine is_member_call: method_call inside call_expression
-    if node.parent and node.parent.type == "call_expression":
-        is_member_call = True
+    if node.type == "method_call":
+        name_node = node.child_by_field_name("name")
+        if name_node:
+            callee_name = _read_text(name_node, source)
+        # Determine is_member_call: method_call inside call_expression
+        if node.parent and node.parent.type == "call_expression":
+            is_member_call = True
+    elif node.type == "new_expression":
+        # Новый HTTPСервисОтвет(200) → callee = HTTPСервисОтвет
+        for child in node.children:
+            if child.type == "identifier":
+                callee_name = _read_text(child, source)
+                break
 ```
 
 ### 4. `extract_bsl()` entry point (in `extract.py`)
@@ -172,7 +194,16 @@ From the position of the recognized folder, walk up **max 2 directory levels** a
 2. `<FolderName>.xml` where root tag is `ExternalDataProcessor` → `Обработка.<Name>`
 3. `<FolderName>.xml` where root tag is `ExternalReport` → `Отчет.<Name>`
 
-XML parsing via `xml.etree.ElementTree`. Only `<Properties><Name>` is read, minimal overhead.
+XML parsing via `xml.etree.ElementTree`. **All 1C:Enterprise XML files use the namespace `http://v8.1c.ru/8.3/MDClasses`**. Before querying, strip namespaces from all element tags:
+
+```python
+def _strip_xml_namespaces(root):
+    for elem in root.iter():
+        if '}' in elem.tag:
+            elem.tag = elem.tag.split('}', 1)[1]
+```
+
+After stripping, `find("Properties/Name")` works. Only `<Properties><Name>` is read, minimal overhead.
 
 If no XML found within 2 levels — file has no metadata root, proceed with object-only enrichment.
 
@@ -241,10 +272,13 @@ Fixtures copied from `/Users/d.korolev/Work/My/Projects/ProjectContext/packages/
 |-------------|-----------|
 | `1c/CommonModules/ТестовыйМодуль1/Ext/Module.bsl` | 2 functions extracted, `calls` edges, metadata node `ОбщийМодуль.ТестовыйМодуль1`, root node from `Configuration.xml` |
 | `1c/InformationRegisters/РегистрСведений1/Ext/RecordSetModule.bsl` | 1 procedure, metadata `РегистрСведений.РегистрСведений1` |
-| `1c/Constants/Константа1/Ext/ManagerModule.bsl` | metadata `Константа.Константа1` |
+| `1c/Constants/Константа1/Ext/ManagerModule.bsl` | metadata `Константа.Константа1`, module type МодульМенеджера |
+| `1c/Constants/Константа1/Ext/ValueManagerModule.bsl` | metadata `Константа.Константа1`, module type МодульМенеджераЗначений |
 | `1c/Documents/ТестовыйДокумент/Forms/ФормаДокумента/Ext/Form/Module.bsl` | metadata `Документ.ТестовыйДокумент.Форма.ФормаДокумента`, 2 procedures |
-| `1c/HTTPServices/ТестовыйHTTPСервис/Ext/Module.bsl` | metadata `HTTPСервис.ТестовыйHTTPСервис`, 2 functions |
+| `1c/HTTPServices/ТестовыйHTTPСервис/Ext/Module.bsl` | metadata `HTTPСервис.ТестовыйHTTPСервис`, 2 functions, `calls` edge to `HTTPСервисОтвет` via `new_expression` |
 | Standalone `.bsl` (no folder structure) | procedures only, no metadata nodes |
+| Extension fixture (synthetic Configuration.xml with parent attribute) | root node `Расширение.<Name>` |
+| External processor fixture (synthetic `<Name>.xml` + `Ext/ObjectModule.bsl`) | root node `Обработка.<Name>` |
 
 Test structure follows the pattern in `tests/test_languages.py`.
 
