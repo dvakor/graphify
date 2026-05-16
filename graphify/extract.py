@@ -1165,6 +1165,18 @@ _SWIFT_CONFIG = LanguageConfig(
     import_handler=_import_swift,
 )
 
+_BSL_CONFIG = LanguageConfig(
+    ts_module="tree_sitter_bsl",
+    class_types=frozenset(),
+    function_types=frozenset({"procedure_definition", "function_definition"}),
+    call_types=frozenset({"method_call", "new_expression"}),
+    call_function_field="name",
+    function_boundary_types=frozenset({"procedure_definition", "function_definition"}),
+    import_types=frozenset(),
+    name_fallback_child_types=("identifier",),
+    function_label_parens=True,
+)
+
 # ── Generic extractor ─────────────────────────────────────────────────────────
 
 def _extract_generic(path: Path, config: LanguageConfig) -> dict:
@@ -1497,6 +1509,10 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
             body = _find_body(node, config)
             if body:
                 function_bodies.append((func_nid, body))
+            elif t in config.function_types:
+                # Flat-body fix: languages without a body wrapper (e.g. BSL)
+                # use the function node itself. walk_calls iterates children.
+                function_bodies.append((func_nid, node))
             return
 
         # JS/TS arrow functions and C# namespaces — language-specific extra handling
@@ -1655,8 +1671,22 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
                         name = func_node.child_by_field_name("field") or func_node.child_by_field_name("name")
                         if name:
                             callee_name = _read_text(name, source)
+            elif config.ts_module == "tree_sitter_bsl":
+                # BSL: method_call has "name" field; new_expression has identifier child
+                if node.type == "method_call":
+                    name_node = node.child_by_field_name("name")
+                    if name_node:
+                        callee_name = _read_text(name_node, source)
+                    # Direct call: parent=call_statement; member call: parent=call_expression/access
+                    if node.parent and node.parent.type in ("call_expression", "access"):
+                        is_member_call = True
+                elif node.type == "new_expression":
+                    # Новый HTTPСервисОтвет(200) → callee = HTTPСервисОтвет
+                    for child in node.children:
+                        if child.type == "identifier":
+                            callee_name = _read_text(child, source)
+                            break
             else:
-                # Generic: get callee from call_function_field
                 func_node = node.child_by_field_name(config.call_function_field) if config.call_function_field else None
                 if func_node:
                     if func_node.type == "identifier":
@@ -1826,7 +1856,13 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
             walk_calls(child, caller_nid)
 
     for caller_nid, body_node in function_bodies:
-        walk_calls(body_node, caller_nid)
+        if body_node.type in config.function_boundary_types:
+            # Flat-body: body IS the function node, iterate children to avoid
+            # function_boundary_types early return in walk_calls
+            for child in body_node.children:
+                walk_calls(child, caller_nid)
+        else:
+            walk_calls(body_node, caller_nid)
 
     # ── Event listener pass ───────────────────────────────────────────────────
     seen_listen_pairs: set[tuple[str, str]] = set()
@@ -5614,6 +5650,243 @@ def extract_delphi_form(path: Path) -> dict:
     return {"nodes": nodes, "edges": edges, "input_tokens": 0, "output_tokens": 0}
 
 
+# ── 1C:Enterprise BSL helpers ─────────────────────────────────────────────────
+
+def _strip_xml_namespaces(root) -> None:
+    """Strip XML namespace prefixes from all element tags in-place.
+
+    1C:Enterprise XML files use xmlns='http://v8.1c.ru/8.3/MDClasses'.
+    Without stripping, find('Properties/Name') returns None because tags
+    become '{http://v8.1c.ru/8.3/MDClasses}Properties'.
+    """
+    for elem in root.iter():
+        if '}' in elem.tag:
+            elem.tag = elem.tag.split('}', 1)[1]
+
+
+_METADATA_FOLDERS: dict[str, str] = {
+    # English folder name (from configurator file dump) → Russian metadata type
+    "Catalogs": "Справочник",
+    "Documents": "Документ",
+    "InformationRegisters": "РегистрСведений",
+    "AccumulationRegisters": "РегистрНакопления",
+    "Reports": "Отчет",
+    "DataProcessors": "Обработка",
+    "Enums": "Перечисление",
+    "ChartsOfCharacteristicTypes": "ПланВидовХарактеристик",
+    "ChartsOfAccounts": "ПланСчетов",
+    "BusinessProcesses": "БизнесПроцесс",
+    "Tasks": "Задача",
+    "ExchangePlans": "ПланОбмена",
+    "Constants": "Константа",
+    "CommonModules": "ОбщийМодуль",
+    "CommonForms": "ОбщаяФорма",
+    "HTTPServices": "HTTPСервис",
+    "WebServices": "WebService",
+    "WSReferences": "WSСсылка",
+    "Subsystems": "Подсистема",
+    "EventSubscriptions": "ПодпискаНаСобытие",
+    "ScheduledJobs": "РегламентноеЗадание",
+    "Roles": "Роль",
+    "FilterCriteria": "КритерийОтбора",
+    "SettingsStorages": "ХранилищеНастроек",
+    "FunctionalOptions": "ФункциональнаяОпция",
+    "FunctionalOptionsParameters": "ПараметрФункциональнойОпции",
+    "DefinedTypes": "ОпределяемыйТип",
+    "CommandGroups": "ГруппаКоманд",
+    "CommonAttributes": "ОбщийРеквизит",
+    "DocumentJournals": "ЖурналДокументов",
+    "DocumentNumerators": "НумераторДокументов",
+    "Sequences": "Последовательность",
+    "ExternalDataSources": "ВнешнийИсточникДанных",
+    "SessionParameters": "ПараметрСеанса",
+    "CommonCommands": "ОбщаяКоманда",
+    "CommonPictures": "ОбщаяКартинка",
+    "CommonTemplates": "ОбщийМакет",
+    "Interfaces": "Интерфейс",
+    "Languages": "Язык",
+}
+
+def _detect_bsl_metadata_root(search_dir: Path) -> tuple[str | None, str | None]:
+    """Detect 1C metadata root by looking for XML files in search_dir.
+
+    Returns (root_type_prefix, root_name) or (None, None).
+    root_type_prefix is one of: Конфигурация, Расширение, Обработка, Отчет.
+    """
+    import xml.etree.ElementTree as ET
+
+    # Try Configuration.xml
+    config_xml = search_dir / "Configuration.xml"
+    if config_xml.is_file():
+        try:
+            tree = ET.parse(config_xml)
+            xml_root = tree.getroot()
+            _strip_xml_namespaces(xml_root)
+            name_elem = xml_root.find(".//Properties/Name")
+            name = name_elem.text if name_elem is not None and name_elem.text else None
+            if name:
+                # Detect extension: check if root tag contains 'Extension', has parent attribute,
+                # or path contains /EXT/ (case-insensitive)
+                is_extension = False
+                for child in xml_root:
+                    child_tag = child.tag
+                    if "Extension" in child_tag:
+                        is_extension = True
+                        break
+                    if child.get("parent") is not None:
+                        is_extension = True
+                        break
+                if not is_extension:
+                    is_extension = any(p.upper() == "EXT" for p in search_dir.parts)
+                prefix = "Расширение" if is_extension else "Конфигурация"
+                return prefix, name
+        except Exception:
+            pass
+
+    # Try <FolderName>.xml for external processors/reports
+    folder_xml = search_dir / f"{search_dir.name}.xml"
+    if folder_xml.is_file():
+        try:
+            tree = ET.parse(folder_xml)
+            xml_root = tree.getroot()
+            _strip_xml_namespaces(xml_root)
+            # Check root tag and children for ExternalDataProcessor/ExternalReport
+            all_tags = [xml_root.tag] + [child.tag for child in xml_root]
+            name_elem = xml_root.find(".//Properties/Name")
+            name = name_elem.text if name_elem is not None and name_elem.text else search_dir.name
+            if any("ExternalDataProcessor" in tag for tag in all_tags):
+                return "Обработка", name
+            elif any("ExternalReport" in tag for tag in all_tags):
+                return "Отчет", name
+        except Exception:
+            pass
+
+    return None, None
+
+
+def _enrich_bsl_metadata_from_path(path: Path, result: dict) -> None:
+    """Enrich BSL extraction with metadata hierarchy from file path and XML.
+
+    Detects metadata root (Конфигурация/Расширение/Обработка/Отчет),
+    maps folder names to metadata types, and builds a contains hierarchy:
+      root → object → [form →] file → procedures
+    """
+    parts = path.parts
+
+    # Shared metadata helpers — used by both EPF fallback and main branch
+    nodes = result.get("nodes", [])
+    edges = result.get("edges", [])
+    str_path = str(path)
+    file_nid = _make_id(str_path)
+    seen_ids: set[str] = {n["id"] for n in nodes}
+
+    def add_node(nid: str, label: str) -> None:
+        if nid not in seen_ids:
+            seen_ids.add(nid)
+            nodes.insert(0, {
+                "id": nid, "label": label, "file_type": "code",
+                "source_file": str_path, "source_location": "L1",
+            })
+
+    def add_edge(src: str, tgt: str, relation: str) -> None:
+        edges.insert(0, {
+            "source": src, "target": tgt, "relation": relation,
+            "confidence": "EXTRACTED", "source_file": str_path,
+            "source_location": "L1", "weight": 1.0,
+        })
+
+    # Find the first recognized metadata folder in the path
+    meta_idx: int | None = None
+    meta_type: str | None = None
+    for i, part in enumerate(parts):
+        if part in _METADATA_FOLDERS:
+            meta_idx = i
+            meta_type = _METADATA_FOLDERS[part]
+            break
+
+    if meta_idx is None or meta_type is None:
+        # Fallback: detect external processors/reports by path pattern
+        # <Name>/<Name>.xml + <Name>/<Name>/Ext/ObjectModule.bsl
+        filename = path.name
+        if filename in ("ObjectModule.bsl", "ManagerModule.bsl", "Module.bsl"):
+            parent = path.parent  # Ext/
+            for level in range(3):
+                search_dir = parent
+                for _ in range(level):
+                    search_dir = search_dir.parent
+                rp, rn = _detect_bsl_metadata_root(search_dir)
+                if rp:
+                    root_label = f"{rp}.{rn}"
+                    root_nid = _make_id(rp, rn)
+                    add_node(root_nid, root_label)
+                    add_edge(root_nid, file_nid, "contains")
+                    return
+        return  # No recognized structure — standalone file
+
+    # Object name is the folder after the metadata type folder
+    obj_name: str | None = None
+    if meta_idx + 1 < len(parts):
+        obj_name = parts[meta_idx + 1]
+    if not obj_name:
+        return
+
+    # Detect metadata root: walk up max 2 levels from the metadata folder
+    meta_dir = Path(*parts[:meta_idx + 1]).parent
+    root_prefix: str | None = None
+    root_name: str | None = None
+    for level in range(3):  # current dir + 2 levels up
+        search_dir = meta_dir
+        for _ in range(level):
+            search_dir = search_dir.parent
+        rp, rn = _detect_bsl_metadata_root(search_dir)
+        if rp:
+            root_prefix, root_name = rp, rn
+            break
+
+    # Object node
+    obj_label = f"{meta_type}.{obj_name}"
+    obj_nid = _make_id(meta_type, obj_name)
+
+    # Form detection: check if "Forms" is in path between metadata folder and file
+    form_nid: str | None = None
+    try:
+        forms_idx = parts.index("Forms", meta_idx)
+        # Form name is the folder after Forms/
+        if forms_idx + 1 < len(parts):
+            form_name = parts[forms_idx + 1]
+            form_label = f"{obj_label}.Форма.{form_name}"
+            form_nid = _make_id(meta_type, obj_name, "Форма", form_name)
+            add_node(form_nid, form_label)
+            add_edge(obj_nid, form_nid, "contains")
+            # Form → file
+            add_edge(form_nid, file_nid, "contains")
+    except ValueError:
+        # No Forms in path — direct object → file
+        add_edge(obj_nid, file_nid, "contains")
+
+    add_node(obj_nid, obj_label)
+
+    # Root node (if detected)
+    if root_prefix and root_name:
+        root_label = f"{root_prefix}.{root_name}"
+        root_nid = _make_id(root_prefix, root_name)
+        add_node(root_nid, root_label)
+        add_edge(root_nid, obj_nid, "contains")
+
+
+def extract_bsl(path: Path) -> dict:
+    """Extract structure from 1C:Enterprise BSL (.bsl) files.
+
+    Uses tree-sitter-bsl for AST parsing (procedures, functions, calls),
+    then enriches with metadata hierarchy from file path and XML.
+    """
+    result = _extract_generic(path, _BSL_CONFIG)
+    if "error" in result:
+        return result
+    _enrich_bsl_metadata_from_path(path, result)
+    return result
+
+
 def extract_lazarus_package(path: Path) -> dict:
     """Extract package metadata from Lazarus .lpk package files (XML format).
 
@@ -6083,6 +6356,7 @@ _DISPATCH: dict[str, Any] = {
     ".dfm": extract_delphi_form,
     ".lfm": extract_lazarus_form,
     ".lpk": extract_lazarus_package,
+    ".bsl": extract_bsl,
     ".sh": extract_bash,
     ".bash": extract_bash,
     ".json": extract_json,
